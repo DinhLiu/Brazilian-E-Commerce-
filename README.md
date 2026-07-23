@@ -2,9 +2,9 @@
 olist-analytics/
 ├── .venv/
 ├── data/
-│   ├── raw/                     # CSV gốc (đã có) — không bao giờ chỉnh sửa trực tiếp
-│   ├── interim/                 # Data sau khi join/clean sơ bộ, chưa hoàn chỉnh
-│   └── processed/               # Data sạch, sẵn sàng cho phân tích (parquet/csv)
+│   ├── raw/                     
+│   ├── interim/                 
+│   └── processed/               
 │
 ├── notebooks/                   # Jupyter notebooks, đánh số theo thứ tự làm việc
 │   ├── 01_data_cleaning.ipynb
@@ -23,7 +23,7 @@ olist-analytics/
 ├── dashboard/                    # App Streamlit hoặc file Power BI/Tableau
 │   └── app.py
 │
-├── documents/                    # (đã có)
+├── documents/                    
 │   ├── ERD.svg
 │   └── schema.png
 │
@@ -31,7 +31,7 @@ olist-analytics/
 │   ├── figures/
 │   └── insights_summary.md
 │
-├── README.md                     # Quan trọng nhất cho CV — xem gợi ý bên dưới
-├── requirements.txt              # (đã có)
-└── .gitignore                    # loại trừ .venv/, data/raw nếu file quá nặng cho GitHub
+├── README.md                    
+├── requirements.txt              
+└── .gitignore                   
 ```
