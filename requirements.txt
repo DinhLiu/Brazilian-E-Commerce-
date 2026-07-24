@@ -6,3 +6,5 @@ pyarrow
 fastparquet
 scipy
 mlxtend
+streamlit
+plotly
