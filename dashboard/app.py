@@ -7,6 +7,7 @@ from pathlib import Path
 
 import plotly.express as px
 import plotly.graph_objects as go
+import pandas as pd
 import streamlit as st
 
 _DASHBOARD_DIR = Path(__file__).resolve().parent
@@ -17,21 +18,35 @@ from loaders import (
     SEGMENT_COLORS,
     SEGMENT_ORDER,
     add_delay_bucket,
+    add_eta_error,
     add_speed_bucket,
+    build_first_orders,
+    category_repeat_rates,
     delivered_valid,
+    eta_by_seller,
+    eta_by_state,
+    eta_risk_overlap,
+    filter_items,
     filter_orders,
+    first_order_metric_compare,
     format_brl,
     format_pct,
     late_by_state,
+    late_cause_breakdown,
     load_category_growth,
     load_category_summary,
+    load_item_level,
     load_market_basket,
     load_orders,
     load_rfm,
     load_risk_sellers,
     load_seller_summary,
+    load_sla_items,
     monthly_trend,
+    risk_sellers_with_sla,
     segment_summary,
+    seller_sla_summary,
+    sla_by_state,
 )
 
 st.set_page_config(
@@ -80,8 +95,11 @@ with st.sidebar:
         [
             "Overview",
             "RFM Segmentation",
+            "Repeat Purchase",
             "Delivery & Reviews",
+            "ETA Calibration",
             "Categories & Sellers",
+            "Seller Fulfillment SLA",
             "Market Basket",
         ],
         label_visibility="collapsed",
@@ -112,6 +130,7 @@ else:
 orders = filter_orders(load_orders(), start_date, end_date, states or None)
 orders_trend = filter_orders(load_orders(trend=True), start_date, end_date, states or None)
 delivery_df = delivered_valid(orders)
+items_df = filter_items(load_item_level(), start_date, end_date, states or None)
 
 
 # ---------------------------------------------------------------------------
@@ -209,9 +228,10 @@ def page_overview() -> None:
         st.plotly_chart(style_fig(fig), width='stretch')
 
     st.info(
-        "**Key platform patterns:** ~97% of customers buy once (RFM); "
-        "~96.7% of multi-eligible baskets are single-product (Market Basket); "
-        "late deliveries (~6.8%) cut avg review from 4.29 → 2.27."
+        "**Key platform patterns:** ~97% of customers buy once; category type predicts "
+        "repeat better than first-order logistics; late deliveries cut avg review "
+        "4.29 → 2.27; most lateness is carrier/transit (not seller SLA), with thin "
+        "ETA buffers in the Northeast."
     )
 
 
@@ -309,7 +329,148 @@ def page_rfm() -> None:
     st.success(
         "**Action priority:** Cannot Lose Them (~15% of customers, ~28% of revenue) "
         "are the top win-back target. Champions are tiny but highest AOV. "
-        "Hibernating is large but low value — deprioritize broad reactivation."
+        "Hibernating is large but low value — deprioritize broad reactivation. "
+        "See **Repeat Purchase** for which first-order categories convert best."
+    )
+
+
+def page_repeat_purchase() -> None:
+    st.header("Repeat Purchase Drivers")
+    st.caption(
+        "First order per customer labeled by eventual RFM frequency (F≥2). "
+        "Sidebar date/state filters apply to category rates via first-order location/time; "
+        "repeat label is global."
+    )
+
+    first = build_first_orders()
+    if states:
+        first = first[first["customer_state"].isin(states)]
+    # Date filter on first-purchase timestamp
+    first = first[
+        (first["order_purchase_timestamp"] >= pd.Timestamp(start_date))
+        & (first["order_purchase_timestamp"] < pd.Timestamp(end_date) + pd.Timedelta(days=1))
+    ]
+
+    if first.empty:
+        st.warning("No first orders in the selected filters.")
+        return
+
+    compare = first_order_metric_compare(first)
+    baseline = first["is_repeat"].mean()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("First-order customers", f"{len(first):,}")
+    c2.metric("Eventual repeat rate", format_pct(baseline))
+    c3.metric("One-time", f"{(~first['is_repeat']).sum():,}")
+    c4.metric("Repeat (F≥2)", f"{first['is_repeat'].sum():,}")
+
+    st.subheader("First-order service quality: one-time vs repeat")
+    metric_labels = {
+        "late_rate": "Late rate",
+        "avg_review": "Avg review",
+        "freight_share": "Freight share",
+        "avg_installments": "Avg installments",
+        "avg_delivery_days": "Avg delivery days",
+    }
+    melted = compare.melt(
+        id_vars=["group"],
+        value_vars=list(metric_labels),
+        var_name="metric",
+        value_name="value",
+    )
+    melted["metric"] = melted["metric"].map(metric_labels)
+    fig = px.bar(
+        melted,
+        x="metric",
+        y="value",
+        color="group",
+        barmode="group",
+        color_discrete_map={"One-time": "#78909C", "Repeat": "#1565C0"},
+        labels={"metric": "First-order metric", "value": "Value", "group": "Outcome"},
+    )
+    st.plotly_chart(style_fig(fig, 400), width="stretch")
+    st.caption(
+        "Gaps are small — first-order late rate / review alone do not explain who returns."
+    )
+
+    st.subheader("Repeat rate by first-order category")
+    min_count = st.slider("Min first-order items per category", 50, 500, 50, 25)
+    rates = category_repeat_rates(load_item_level(), first, min_count=min_count)
+    if rates.empty:
+        st.warning("No categories meet the minimum count.")
+        return
+
+    top = rates.head(15).copy()
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=top["repeat_rate"],
+            y=top["product_category_name_english"],
+            orientation="h",
+            marker_color="#2E7D32",
+            error_x=dict(
+                type="data",
+                array=top["ci_high"] - top["repeat_rate"],
+                arrayminus=top["repeat_rate"] - top["ci_low"],
+                thickness=1.2,
+                width=3,
+            ),
+            name="Repeat rate",
+        )
+    )
+    fig.add_vline(
+        x=baseline,
+        line_dash="dash",
+        line_color="#C62828",
+        annotation_text=f"baseline {baseline*100:.2f}%",
+    )
+    fig.update_layout(
+        yaxis=dict(categoryorder="array", categoryarray=top["product_category_name_english"][::-1].tolist()),
+        xaxis=dict(title="Eventual repeat rate", tickformat=".0%"),
+    )
+    st.plotly_chart(style_fig(fig, 520), width="stretch")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Highest repeat categories**")
+        hi = rates.head(10).copy()
+        hi["repeat_rate"] = hi["repeat_rate"].map(lambda x: f"{x*100:.1f}%")
+        hi["ci"] = hi.apply(lambda r: f"{r['ci_low']*100:.1f}–{r['ci_high']*100:.1f}%", axis=1)
+        st.dataframe(
+            hi[["product_category_name_english", "repeat_rate", "count", "ci"]].rename(
+                columns={
+                    "product_category_name_english": "Category",
+                    "repeat_rate": "Repeat rate",
+                    "count": "N",
+                    "ci": "Wilson CI",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+    with right:
+        st.markdown("**Lowest repeat categories**")
+        lo = rates.sort_values("repeat_rate").head(10).copy()
+        lo["repeat_rate"] = lo["repeat_rate"].map(lambda x: f"{x*100:.1f}%")
+        lo["ci"] = lo.apply(lambda r: f"{r['ci_low']*100:.1f}–{r['ci_high']*100:.1f}%", axis=1)
+        st.dataframe(
+            lo[["product_category_name_english", "repeat_rate", "count", "ci"]].rename(
+                columns={
+                    "product_category_name_english": "Category",
+                    "repeat_rate": "Repeat rate",
+                    "count": "N",
+                    "ci": "Wilson CI",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+    st.success(
+        "**Insight:** Category type matters more than first-order logistics. "
+        "Reliable high-repeat starts: home_appliances, fashion_bags_accessories, "
+        "furniture_decor, bed_bath_table. Electronics / musical_instruments stay low. "
+        "Target win-back by first-purchase category — don’t rely on service fixes alone."
     )
 
 
@@ -437,7 +598,145 @@ def page_delivery() -> None:
 
     st.warning(
         "**Ops focus:** Northeast cluster (AL, MA, SE, PI, CE) shows the highest late rates "
-        "and weakest reviews. Treat 7–8 day delay as an early-warning KPI for proactive outreach."
+        "and weakest reviews. Treat 7–8 day delay as an early-warning KPI for proactive outreach. "
+        "See **ETA Calibration** for buffer gaps and **Seller Fulfillment SLA** for cause split."
+    )
+
+
+def page_eta_calibration() -> None:
+    st.header("ETA Calibration")
+    st.caption(
+        "eta_error = delivery_time − estimated_delivery_time (days). "
+        "Negative = conservative buffer; positive = over-optimistic ETA. "
+        "Uses delivered orders with valid timestamps."
+    )
+
+    if delivery_df.empty:
+        st.warning("No delivered orders in the selected filters.")
+        return
+
+    with_err = add_eta_error(delivery_df)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Orders", f"{len(with_err):,}")
+    c2.metric("Mean ETA error", f"{with_err['eta_error'].mean():.1f}d")
+    c3.metric("Median ETA error", f"{with_err['eta_error'].median():.0f}d")
+    c4.metric("Late rate", format_pct(with_err["is_late"].mean()))
+
+    min_orders = st.slider("Min orders (state/seller)", 30, 200, 30, 10, key="eta_min")
+
+    state_eta = eta_by_state(delivery_df, min_orders=min_orders)
+    if state_eta.empty:
+        st.warning("No states meet the minimum order threshold.")
+        return
+
+    corr_late = state_eta[["avg_eta_error", "late_rate"]].corr().iloc[0, 1]
+    corr_rev = state_eta[["avg_eta_error", "avg_review"]].corr().iloc[0, 1]
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("ETA error vs late rate (by state)")
+        fig = px.scatter(
+            state_eta,
+            x="avg_eta_error",
+            y="late_rate",
+            size="n_orders",
+            text="customer_state",
+            labels={
+                "avg_eta_error": "Avg ETA error (days)",
+                "late_rate": "Late rate",
+                "n_orders": "Orders",
+            },
+            color="avg_eta_error",
+            color_continuous_scale="YlOrRd",
+        )
+        fig.update_traces(textposition="top center")
+        fig.update_layout(
+            title=f"corr = {corr_late:.3f}",
+            yaxis_tickformat=".0%",
+        )
+        st.plotly_chart(style_fig(fig, 420), width="stretch")
+
+    with right:
+        st.subheader("ETA error vs avg review (by state)")
+        fig = px.scatter(
+            state_eta,
+            x="avg_eta_error",
+            y="avg_review",
+            size="n_orders",
+            text="customer_state",
+            labels={
+                "avg_eta_error": "Avg ETA error (days)",
+                "avg_review": "Avg review",
+                "n_orders": "Orders",
+            },
+            color="avg_review",
+            color_continuous_scale="RdYlGn",
+        )
+        fig.update_traces(textposition="top center")
+        fig.update_layout(title=f"corr = {corr_rev:.3f}")
+        st.plotly_chart(style_fig(fig, 420), width="stretch")
+
+    st.subheader("Thinnest ETA buffers by state")
+    thin = state_eta.head(10).copy()
+    thin["avg_eta_error"] = thin["avg_eta_error"].map(lambda x: f"{x:.2f}")
+    thin["late_rate"] = thin["late_rate"].map(lambda x: f"{x*100:.1f}%")
+    thin["avg_review"] = thin["avg_review"].map(lambda x: f"{x:.2f}")
+    st.dataframe(
+        thin.rename(
+            columns={
+                "customer_state": "State",
+                "avg_eta_error": "Avg ETA error",
+                "late_rate": "Late rate",
+                "avg_review": "Avg review",
+                "n_orders": "Orders",
+            }
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.subheader("Sellers with least ETA buffer")
+    seller_eta = eta_by_seller(items_df, min_orders=min_orders)
+    top_sellers = seller_eta.head(15).copy()
+    top_sellers["seller_short"] = top_sellers["seller_id"].str[:14] + "…"
+    fig = px.bar(
+        top_sellers,
+        x="avg_eta_error",
+        y="seller_short",
+        orientation="h",
+        color="late_rate",
+        color_continuous_scale="YlOrRd",
+        hover_data={"seller_id": True, "avg_review": ":.2f", "n_orders": True},
+        labels={
+            "avg_eta_error": "Avg ETA error (days)",
+            "seller_short": "Seller",
+            "late_rate": "Late rate",
+        },
+    )
+    fig.update_layout(yaxis=dict(categoryorder="total ascending"))
+    st.plotly_chart(style_fig(fig, 480), width="stretch")
+
+    risk = load_risk_sellers()
+    overlap = eta_risk_overlap(seller_eta, risk)
+    st.subheader(f"Risk sellers ∩ ETA table ({len(overlap)} of {len(risk)})")
+    if not overlap.empty:
+        ov = overlap.sort_values("avg_eta_error", ascending=False).copy()
+        ov["seller_short"] = ov["seller_id"].str[:16] + "…"
+        display = pd.DataFrame({
+            "Seller": ov["seller_short"],
+            "Avg ETA error": ov["avg_eta_error"].map(lambda x: f"{x:.2f}"),
+            "Late rate": ov["late_rate"].map(lambda x: f"{x*100:.1f}%"),
+            "Avg review": ov["avg_review_risk"].map(lambda x: f"{x:.2f}"),
+            "Revenue": ov["total_revenue"].map(format_brl),
+            "Orders": ov["n_orders_risk"],
+        })
+        st.dataframe(display, width="stretch", hide_index=True)
+
+    st.warning(
+        "**Action:** Platform ETA is conservative overall (median ≈ −12d), but Northeast "
+        "states (AL, MA, SE, CE, BA, PI) have thinner buffers and high late rates. "
+        "Widening ETA promises there is cheaper than rebuilding logistics. "
+        "Also tighten promises for sellers with near-zero/positive avg ETA error."
     )
 
 
@@ -549,27 +848,186 @@ def page_categories_sellers() -> None:
     with s2:
         st.markdown("**Risk sellers** — top-quartile revenue & avg review < 3.5")
         st.metric("Flagged sellers", f"{len(risk):,}")
-        risk_view = risk.copy()
-        risk_view["seller_id"] = risk_view["seller_id"].str[:16] + "…"
+        sla_summary = seller_sla_summary(load_sla_items(), min_orders=30)
+        risk_sla = risk_sellers_with_sla(risk, sla_summary).sort_values(
+            "seller_missed_sla_rate", ascending=False
+        )
+        risk_view = risk_sla.copy()
+        risk_view["seller_id"] = risk_view["seller_id"].str[:14] + "…"
         risk_view["total_revenue"] = risk_view["total_revenue"].map(format_brl)
         risk_view["avg_review"] = risk_view["avg_review"].map(lambda x: f"{x:.2f}")
+        risk_view["seller_missed_sla_rate"] = risk_view["seller_missed_sla_rate"].map(
+            lambda x: f"{x*100:.1f}%" if pd.notna(x) else "—"
+        )
         st.dataframe(
-            risk_view.rename(
+            risk_view[
+                ["seller_id", "total_revenue", "n_orders", "avg_review", "seller_missed_sla_rate"]
+            ].rename(
                 columns={
                     "seller_id": "Seller",
                     "total_revenue": "Revenue",
                     "n_orders": "Orders",
                     "avg_review": "Avg review",
+                    "seller_missed_sla_rate": "SLA miss",
                 }
             ),
-            width='stretch',
+            width="stretch",
             hide_index=True,
             height=420,
         )
 
     st.error(
-        "Audit high-revenue / low-review sellers before scaling volume — "
-        "notably `7c67e1448b…` (#5 by revenue, ~972 orders, review 3.35)."
+        "Audit high-revenue / low-review sellers before scaling volume. "
+        "SLA miss rates split fulfillment offenders from quality-only issues — "
+        "see **Seller Fulfillment SLA** (e.g. `54965bbe…` high SLA miss vs "
+        "`7c67e1448b…` ships early but weak reviews)."
+    )
+
+
+def page_seller_sla() -> None:
+    st.header("Seller Fulfillment SLA")
+    st.caption(
+        "Seller stage: handoff after shipping_limit_date. "
+        "Carrier stage: transit vs remaining ETA. "
+        "Primary cause attributed on late items only."
+    )
+
+    sla_all = load_sla_items()
+    sla = filter_items(sla_all, start_date, end_date, states or None)
+    if sla.empty:
+        st.warning("No delivered items in the selected filters.")
+        return
+
+    causes = late_cause_breakdown(sla)
+    miss_rate = sla["seller_missed_sla"].mean()
+    late_rate = sla["is_late_overall"].mean()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Delivered items", f"{len(sla):,}")
+    c2.metric("Seller SLA miss", format_pct(miss_rate))
+    c3.metric("Late vs ETA", format_pct(late_rate))
+    c4.metric("Median seller delay", f"{sla['seller_delay'].median():.0f}d")
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Primary cause of late deliveries")
+        if causes.empty:
+            st.info("No late items in filter.")
+        else:
+            fig = px.pie(
+                causes,
+                names="cause",
+                values="share",
+                color="cause",
+                color_discrete_map={
+                    "carrier": "#1565C0",
+                    "seller": "#C62828",
+                    "both": "#F9A825",
+                },
+                hole=0.35,
+            )
+            fig.update_traces(textinfo="label+percent")
+            st.plotly_chart(style_fig(fig, 360), width="stretch")
+            st.caption("Platform-wide, most lateness is carrier/transit — not seller handoff.")
+
+    with right:
+        st.subheader("Seller SLA miss by state")
+        min_orders = st.slider("Min orders per state", 30, 200, 30, 10, key="sla_state_min")
+        state_sla = sla_by_state(sla, min_orders=min_orders)
+        if state_sla.empty:
+            st.warning("No states meet the threshold.")
+        else:
+            fig = px.scatter(
+                state_sla,
+                x="seller_missed_sla_rate",
+                y="avg_carrier_delay",
+                size="n_orders",
+                text="customer_state",
+                labels={
+                    "seller_missed_sla_rate": "Seller SLA miss rate",
+                    "avg_carrier_delay": "Avg carrier delay (days)",
+                    "n_orders": "Orders",
+                },
+                color="seller_missed_sla_rate",
+                color_continuous_scale="YlOrRd",
+            )
+            fig.update_traces(textposition="top center")
+            fig.update_layout(xaxis_tickformat=".0%")
+            st.plotly_chart(style_fig(fig, 360), width="stretch")
+            st.caption(
+                "SLA miss is fairly flat by state (~5–6%); Northeast lateness is not a "
+                "seller-prep bottleneck."
+            )
+
+    st.subheader("Risk sellers by SLA miss rate")
+    min_seller = st.slider("Min orders per seller (SLA sample)", 30, 100, 30, 10, key="sla_seller_min")
+    seller_sla = seller_sla_summary(sla, min_orders=min_seller)
+    risk = load_risk_sellers()
+    risk_sla = risk_sellers_with_sla(risk, seller_sla).sort_values(
+        "seller_missed_sla_rate", ascending=False
+    )
+
+    view = risk_sla.copy()
+    view["seller_short"] = view["seller_id"].str[:16] + "…"
+    fig = px.bar(
+        view.dropna(subset=["seller_missed_sla_rate"]).head(18),
+        x="seller_missed_sla_rate",
+        y="seller_short",
+        orientation="h",
+        color="avg_review",
+        color_continuous_scale="RdYlGn",
+        range_color=(2.5, 4),
+        hover_data={"seller_id": True, "total_revenue": ":,.0f", "n_orders": True},
+        labels={
+            "seller_missed_sla_rate": "SLA miss rate",
+            "seller_short": "Seller",
+            "avg_review": "Avg review",
+        },
+    )
+    fig.update_layout(
+        yaxis=dict(categoryorder="total ascending"),
+        xaxis_tickformat=".0%",
+    )
+    st.plotly_chart(style_fig(fig, 480), width="stretch")
+
+    table = risk_sla.copy()
+    table["seller_id"] = table["seller_id"].str[:16] + "…"
+    table["total_revenue"] = table["total_revenue"].map(format_brl)
+    table["avg_review"] = table["avg_review"].map(lambda x: f"{x:.2f}")
+    table["seller_missed_sla_rate"] = table["seller_missed_sla_rate"].map(
+        lambda x: f"{x*100:.1f}%" if pd.notna(x) else "n<30"
+    )
+    table["avg_seller_delay"] = table["avg_seller_delay"].map(
+        lambda x: f"{x:.2f}" if pd.notna(x) else "—"
+    )
+    st.dataframe(
+        table[
+            [
+                "seller_id",
+                "total_revenue",
+                "n_orders",
+                "avg_review",
+                "seller_missed_sla_rate",
+                "avg_seller_delay",
+            ]
+        ].rename(
+            columns={
+                "seller_id": "Seller",
+                "total_revenue": "Revenue",
+                "n_orders": "Orders",
+                "avg_review": "Avg review",
+                "seller_missed_sla_rate": "SLA miss",
+                "avg_seller_delay": "Avg seller delay",
+            }
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.error(
+        "**Insight:** ~78% of late items are carrier-only; seller SLA miss is only ~4.7% overall. "
+        "Split risk sellers: fulfillment offenders (`54965bbe…`, `88460e8e…`, `a7f13822…`) vs "
+        "quality issues that ship on time (`7c67e1448b…`). NE delay → transit + ETA, not seller prep."
     )
 
 
@@ -615,8 +1073,11 @@ def page_market_basket() -> None:
 PAGES = {
     "Overview": page_overview,
     "RFM Segmentation": page_rfm,
+    "Repeat Purchase": page_repeat_purchase,
     "Delivery & Reviews": page_delivery,
+    "ETA Calibration": page_eta_calibration,
     "Categories & Sellers": page_categories_sellers,
+    "Seller Fulfillment SLA": page_seller_sla,
     "Market Basket": page_market_basket,
 }
 

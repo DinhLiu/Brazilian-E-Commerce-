@@ -89,6 +89,21 @@ def load_market_basket() -> pd.DataFrame:
     return _read("market_basket_rules.parquet")
 
 
+@st.cache_data(show_spinner=False)
+def load_item_level() -> pd.DataFrame:
+    df = _read("item_level.parquet")
+    for col in (
+        "order_purchase_timestamp",
+        "order_delivered_carrier_date",
+        "order_delivered_customer_date",
+        "order_estimated_delivery_date",
+        "shipping_limit_date",
+    ):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col])
+    return df
+
+
 def filter_orders(
     df: pd.DataFrame,
     start: pd.Timestamp | None = None,
@@ -178,6 +193,235 @@ def monthly_trend(df: pd.DataFrame) -> pd.DataFrame:
             late_rate=("is_late", "mean"),
         )
         .sort_values("month")
+    )
+
+
+def filter_items(
+    df: pd.DataFrame,
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+    states: list[str] | None = None,
+) -> pd.DataFrame:
+    out = df
+    if start is not None:
+        out = out[out["order_purchase_timestamp"] >= pd.Timestamp(start)]
+    if end is not None:
+        out = out[out["order_purchase_timestamp"] < pd.Timestamp(end) + pd.Timedelta(days=1)]
+    if states:
+        out = out[out["customer_state"].isin(states)]
+    return out
+
+
+def delivered_valid_items(df: pd.DataFrame) -> pd.DataFrame:
+    return df[(df["order_status"] == "delivered") & ~df["is_invalid_timestamps"]].copy()
+
+
+# ---------------------------------------------------------------------------
+# Notebook 07 — repeat purchase drivers
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def build_first_orders() -> pd.DataFrame:
+    """First order per customer labeled with eventual RFM frequency / is_repeat."""
+    orders = load_orders()
+    rfm = load_rfm()
+    first = (
+        orders.sort_values("order_purchase_timestamp")
+        .drop_duplicates(subset="customer_unique_id", keep="first")
+        .copy()
+    )
+    first = first.merge(
+        rfm[["customer_unique_id", "frequency"]],
+        on="customer_unique_id",
+        how="left",
+    )
+    first["is_repeat"] = first["frequency"] >= 2
+    denom = first["total_freight"] + first["total_price"]
+    first["freight_share"] = np.where(denom > 0, first["total_freight"] / denom, np.nan)
+    return first
+
+
+def first_order_metric_compare(first_orders: pd.DataFrame) -> pd.DataFrame:
+    metrics = {
+        "late_rate": ("is_late", "mean"),
+        "avg_review": ("review_score", "mean"),
+        "freight_share": ("freight_share", "mean"),
+        "avg_installments": ("n_payment_installments", "mean"),
+        "avg_delivery_days": ("delivery_time", "mean"),
+        "n_customers": ("customer_unique_id", "count"),
+    }
+    rows = []
+    for is_repeat, label in [(False, "One-time"), (True, "Repeat")]:
+        subset = first_orders[first_orders["is_repeat"] == is_repeat]
+        row = {"group": label, "is_repeat": is_repeat}
+        for name, (col, how) in metrics.items():
+            row[name] = getattr(subset[col], how)() if len(subset) else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def category_repeat_rates(
+    item_level: pd.DataFrame,
+    first_orders: pd.DataFrame,
+    min_count: int = 50,
+) -> pd.DataFrame:
+    from statsmodels.stats.proportion import proportion_confint
+
+    first_ids = set(first_orders["order_id"])
+    items = item_level[item_level["order_id"].isin(first_ids)].copy()
+    items = items.merge(
+        first_orders[["order_id", "is_repeat"]],
+        on="order_id",
+        how="left",
+    )
+    rates = (
+        items.groupby("product_category_name_english", as_index=False)
+        .agg(repeat_rate=("is_repeat", "mean"), n_orders=("order_id", "nunique"))
+    )
+    # count rows used for CI (notebook used item rows / is_repeat mean * count)
+    counts = (
+        items.groupby("product_category_name_english")
+        .agg(count=("is_repeat", "size"), mean=("is_repeat", "mean"))
+        .reset_index()
+    )
+    rates = rates.merge(counts, on="product_category_name_english")
+    rates = rates[rates["count"] >= min_count].copy()
+    successes = rates["mean"].mul(rates["count"]).round().astype(int)
+    ci_low, ci_high = proportion_confint(
+        successes, rates["count"], method="wilson"
+    )
+    rates["ci_low"] = ci_low
+    rates["ci_high"] = ci_high
+    rates["repeat_rate"] = rates["mean"]
+    return rates.sort_values("repeat_rate", ascending=False)
+
+
+# ---------------------------------------------------------------------------
+# Notebook 08 — ETA calibration
+# ---------------------------------------------------------------------------
+def add_eta_error(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["eta_error"] = out["delivery_time"] - out["estimated_delivery_time"]
+    return out
+
+
+def eta_by_state(df: pd.DataFrame, min_orders: int = 30) -> pd.DataFrame:
+    tmp = add_eta_error(df)
+    by_state = (
+        tmp.groupby("customer_state", as_index=False)
+        .agg(
+            avg_eta_error=("eta_error", "mean"),
+            late_rate=("is_late", "mean"),
+            avg_review=("review_score", "mean"),
+            n_orders=("order_id", "nunique"),
+        )
+    )
+    return by_state[by_state["n_orders"] >= min_orders].sort_values(
+        "avg_eta_error", ascending=False
+    )
+
+
+def eta_by_seller(item_level: pd.DataFrame, min_orders: int = 30) -> pd.DataFrame:
+    tmp = delivered_valid_items(item_level)
+    tmp["eta_error"] = (
+        (tmp["order_delivered_customer_date"] - tmp["order_purchase_timestamp"]).dt.days
+        - (tmp["order_estimated_delivery_date"] - tmp["order_purchase_timestamp"]).dt.days
+    )
+    by_seller = (
+        tmp.groupby("seller_id", as_index=False)
+        .agg(
+            avg_eta_error=("eta_error", "mean"),
+            late_rate=("eta_error", lambda s: (s > 0).mean()),
+            avg_review=("review_score", "mean"),
+            n_orders=("order_id", "nunique"),
+        )
+    )
+    return by_seller[by_seller["n_orders"] >= min_orders].sort_values(
+        "avg_eta_error", ascending=False
+    )
+
+
+def eta_risk_overlap(eta_sellers: pd.DataFrame, risk_sellers: pd.DataFrame) -> pd.DataFrame:
+    return eta_sellers.merge(risk_sellers, on="seller_id", how="inner", suffixes=("_eta", "_risk"))
+
+
+# ---------------------------------------------------------------------------
+# Notebook 09 — seller fulfillment SLA
+# ---------------------------------------------------------------------------
+def prepare_sla_items(item_level: pd.DataFrame) -> pd.DataFrame:
+    tmp = delivered_valid_items(item_level)
+    tmp["seller_delay"] = (
+        tmp["order_delivered_carrier_date"] - tmp["shipping_limit_date"]
+    ).dt.days
+    tmp["seller_missed_sla"] = tmp["seller_delay"] > 0
+    tmp["carrier_transit_days"] = (
+        tmp["order_delivered_customer_date"] - tmp["order_delivered_carrier_date"]
+    ).dt.days
+    tmp["estimated_transit_days"] = (
+        tmp["order_estimated_delivery_date"] - tmp["shipping_limit_date"]
+    ).dt.days
+    tmp["carrier_delay"] = tmp["carrier_transit_days"] - tmp["estimated_transit_days"]
+    tmp["is_late_overall"] = (
+        tmp["order_delivered_customer_date"] > tmp["order_estimated_delivery_date"]
+    )
+
+    seller = tmp["seller_missed_sla"].fillna(False)
+    carrier = (tmp["carrier_delay"] > 0).fillna(False)
+    cause = np.full(len(tmp), "both", dtype=object)
+    cause[seller & ~carrier] = "seller"
+    cause[~seller & carrier] = "carrier"
+    tmp["primary_cause"] = np.where(tmp["is_late_overall"].fillna(False), cause, pd.NA)
+    return tmp
+
+
+@st.cache_data(show_spinner=False)
+def load_sla_items() -> pd.DataFrame:
+    return prepare_sla_items(load_item_level())
+
+
+def late_cause_breakdown(sla_items: pd.DataFrame) -> pd.DataFrame:
+    late = sla_items[sla_items["is_late_overall"].fillna(False)]
+    if late.empty:
+        return pd.DataFrame(columns=["cause", "n", "share"])
+    counts = late["primary_cause"].value_counts(dropna=False).rename_axis("cause").reset_index(name="n")
+    counts["share"] = counts["n"] / counts["n"].sum()
+    return counts
+
+
+def seller_sla_summary(sla_items: pd.DataFrame, min_orders: int = 30) -> pd.DataFrame:
+    deduped = sla_items.drop_duplicates(subset=["order_id", "seller_id"])
+    summary = (
+        deduped.groupby("seller_id", as_index=False)
+        .agg(
+            seller_missed_sla_rate=("seller_missed_sla", "mean"),
+            avg_seller_delay=("seller_delay", "mean"),
+            n_orders=("order_id", "nunique"),
+        )
+    )
+    return summary[summary["n_orders"] >= min_orders].sort_values(
+        "seller_missed_sla_rate", ascending=False
+    )
+
+
+def risk_sellers_with_sla(
+    risk_sellers: pd.DataFrame,
+    seller_sla: pd.DataFrame,
+) -> pd.DataFrame:
+    return risk_sellers.merge(seller_sla, on="seller_id", how="left", suffixes=("", "_sla"))
+
+
+def sla_by_state(sla_items: pd.DataFrame, min_orders: int = 30) -> pd.DataFrame:
+    deduped = sla_items.drop_duplicates(subset=["order_id", "seller_id"])
+    by_state = (
+        deduped.groupby("customer_state", as_index=False)
+        .agg(
+            seller_missed_sla_rate=("seller_missed_sla", "mean"),
+            avg_seller_delay=("seller_delay", "mean"),
+            avg_carrier_delay=("carrier_delay", "mean"),
+            n_orders=("order_id", "nunique"),
+        )
+    )
+    return by_state[by_state["n_orders"] >= min_orders].sort_values(
+        "seller_missed_sla_rate", ascending=False
     )
 
 
